@@ -372,6 +372,7 @@ export class McpClient implements INodeType {
 					capabilities: {
 						prompts: {},
 						resources: {},
+
 						tools: {},
 					},
 				},
