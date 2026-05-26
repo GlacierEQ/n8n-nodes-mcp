@@ -6,14 +6,13 @@ import {
 	NodeConnectionType,
 	NodeOperationError,
 } from 'n8n-workflow';
-import { DynamicStructuredTool } from '@langchain/core/tools';
-import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
+import { parseHeaders, mergeHeaders } from './utils';
 
 // Add Node.js process type declaration
 declare const process: {
@@ -89,6 +88,31 @@ export class McpClient implements INodeType {
 				],
 				default: 'cmd',
 				description: 'Choose the transport type to connect to MCP server',
+			},
+			{
+				displayName: 'Uri Override',
+				name: 'uriOverride',
+				type: 'string',
+				displayOptions: {
+					show: {
+						connectionType: ['sse', 'http'],
+					},
+				},
+				default: '',
+				description: 'Override the URL from credentials with a custom URL',
+			},
+			{
+				displayName: 'Headers Override',
+				name: 'headersOverride',
+				type: 'string',
+				displayOptions: {
+					show: {
+						connectionType: ['sse', 'http'],
+					},
+				},
+				default: '',
+				description:
+					'Additional headers to send in the request in NAME=VALUE format, separated by newlines (e.g., Authorization=Bearer token). These will be merged with headers from credentials, with override headers taking precedence.',
 			},
 			{
 				displayName: 'Operation',
@@ -220,27 +244,38 @@ export class McpClient implements INodeType {
 				// Dynamically import the HTTP client
 				const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
 
-				const httpStreamUrl = httpCredentials.httpStreamUrl as string;
+				// Get URI override or use credentials URL
+				const uriOverride = this.getNodeParameter('uriOverride', 0) as string;
+				let httpStreamUrl: string;
+
+				if (uriOverride && uriOverride.trim()) {
+					try {
+						// Validate URL format
+						new URL(uriOverride.trim());
+						httpStreamUrl = uriOverride.trim();
+					} catch (error) {
+						throw new NodeOperationError(this.getNode(), `Invalid URI override format: ${uriOverride}`);
+					}
+				} else {
+					httpStreamUrl = httpCredentials.httpStreamUrl as string;
+				}
 				const messagesPostEndpoint = (httpCredentials.messagesPostEndpoint as string) || '';
 				timeout = httpCredentials.httpTimeout as number || 60000;
 
-				// Parse headers
-				let headers: Record<string, string> = {};
-				if (httpCredentials.headers) {
-					const headerLines = (httpCredentials.headers as string).split('\n');
-					for (const line of headerLines) {
-						const equalsIndex = line.indexOf('=');
-						// Ensure '=' is present and not the first character of the line
-						if (equalsIndex > 0) {
-							const name = line.substring(0, equalsIndex).trim();
-							const value = line.substring(equalsIndex + 1).trim();
-							// Add to headers object if key is not empty and value is defined
-							if (name && value !== undefined) {
-								headers[name] = value;
-							}
-						}
-					}
+				// Parse headers from credentials
+				const credentialHeaders = parseHeaders((httpCredentials.headers as string) || '');
+
+				// Get headers override
+				let headersOverrideStr = '';
+				try {
+					headersOverrideStr = this.getNodeParameter('headersOverride', 0, '') as string;
+				} catch (error) {
+					// Parameter doesn't exist, ignore
 				}
+				const overrideHeaders = parseHeaders(headersOverrideStr);
+
+				// Merge headers with override headers taking precedence
+				const headers = mergeHeaders(credentialHeaders, overrideHeaders);
 
 				const requestInit: RequestInit = { headers };
 				if (messagesPostEndpoint) {
@@ -258,27 +293,37 @@ export class McpClient implements INodeType {
 				// Dynamically import the SSE client to avoid TypeScript errors
 				const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
 
-				const sseUrl = sseCredentials.sseUrl as string;
+				// Get URI override or use credentials URL
+				const uriOverride = this.getNodeParameter('uriOverride', 0) as string;
+				let sseUrl: string;
+				if (uriOverride && uriOverride.trim()) {
+					try {
+						// Validate URL format
+						new URL(uriOverride.trim());
+						sseUrl = uriOverride.trim();
+					} catch (error) {
+						throw new NodeOperationError(this.getNode(), `Invalid URI override format: ${uriOverride}`);
+					}
+				} else {
+					sseUrl = sseCredentials.sseUrl as string;
+				}
 				const messagesPostEndpoint = (sseCredentials.messagesPostEndpoint as string) || '';
 				timeout = sseCredentials.sseTimeout as number || 60000;
 
-				// Parse headers
-				let headers: Record<string, string> = {};
-				if (sseCredentials.headers) {
-					const headerLines = (sseCredentials.headers as string).split('\n');
-					for (const line of headerLines) {
-						const equalsIndex = line.indexOf('=');
-						// Ensure '=' is present and not the first character of the line
-						if (equalsIndex > 0) {
-							const name = line.substring(0, equalsIndex).trim();
-							const value = line.substring(equalsIndex + 1).trim();
-							// Add to headers object if key is not empty and value is defined
-							if (name && value !== undefined) {
-								headers[name] = value;
-							}
-						}
-					}
+				// Parse headers from credentials
+				const credentialHeaders = parseHeaders((sseCredentials.headers as string) || '');
+
+				// Get headers override
+				let headersOverrideStr = '';
+				try {
+					headersOverrideStr = this.getNodeParameter('headersOverride', 0, '') as string;
+				} catch (error) {
+					// Parameter doesn't exist, ignore
 				}
+				const overrideHeaders = parseHeaders(headersOverrideStr);
+
+				// Merge headers with override headers taking precedence
+				const headers = mergeHeaders(credentialHeaders, overrideHeaders);
 
 				// Create SSE transport with dynamic import to avoid TypeScript errors
 				transport = new SSEClientTransport(
@@ -425,108 +470,36 @@ export class McpClient implements INodeType {
 				}
 
 				case 'listTools': {
-					const rawTools = await client.listTools();
-					const tools = Array.isArray(rawTools)
-						? rawTools
-						: Array.isArray(rawTools?.tools)
-							? rawTools.tools
-							: typeof rawTools?.tools === 'object' && rawTools.tools !== null
-							? Object.values(rawTools.tools)
-							: [];
+					try {
+						const rawTools = await client.listTools();
+						this.logger.debug(`[MCP][listTools] Received tools from server: ${JSON.stringify(rawTools, null, 2)}`);
+						const tools = Array.isArray(rawTools)
+							? rawTools
+							: Array.isArray(rawTools?.tools)
+								? rawTools.tools
+								: typeof rawTools?.tools === 'object' && rawTools.tools !== null
+								? Object.values(rawTools.tools)
+								: [];
 
-					if (!tools.length) {
-						this.logger.warn('No tools found from MCP client response.');
-						throw new NodeOperationError(this.getNode(), 'No tools found from MCP client');
-					}
+						if (!tools.length) {
+							this.logger.warn('No tools found from MCP client response.');
+							throw new NodeOperationError(this.getNode(), 'No tools found from MCP client');
+						}
 
-					const aiTools = tools.map((tool: any) => {
-						const paramSchema = tool.inputSchema?.properties
-							? z.object(
-								Object.entries(tool.inputSchema.properties).reduce(
-									(acc: any, [key, prop]: [string, any]) => {
-										let zodType: z.ZodType;
-
-										switch (prop.type) {
-											case 'string':
-												zodType = z.string();
-												break;
-											case 'number':
-												zodType = z.number();
-												break;
-											case 'integer':
-												zodType = z.number().int();
-												break;
-											case 'boolean':
-												zodType = z.boolean();
-												break;
-											case 'array':
-												if (prop.items?.type === 'string') {
-													zodType = z.array(z.string());
-												} else if (prop.items?.type === 'number') {
-													zodType = z.array(z.number());
-												} else if (prop.items?.type === 'boolean') {
-													zodType = z.array(z.boolean());
-												} else {
-													zodType = z.array(z.any());
-												}
-												break;
-											case 'object':
-												zodType = z.record(z.string(), z.any());
-												break;
-											default:
-												zodType = z.any();
-										}
-
-										if (prop.description) {
-											zodType = zodType.describe(prop.description);
-										}
-
-										if (!tool.inputSchema?.required?.includes(key)) {
-											zodType = zodType.optional();
-										}
-
-										return {
-											...acc,
-											[key]: zodType,
-										};
-									},
-									{},
-								),
-							)
-							: z.object({});
-
-						return new DynamicStructuredTool({
+						const outputTools = tools.map((tool: any) => ({
 							name: tool.name,
 							description: tool.description || `Execute the ${tool.name} tool`,
-							schema: paramSchema,
-							func: async (params) => {
-								try {
-									const result = await client.callTool({
-										name: tool.name,
-										arguments: params,
-									}, CallToolResultSchema, requestOptions);
-
-									return typeof result === 'object' ? JSON.stringify(result) : String(result);
-								} catch (error) {
-									throw new NodeOperationError(
-										this.getNode(),
-										`Failed to execute ${tool.name}: ${(error as Error).message}`,
-									);
-								}
-							},
+							schema: tool.inputSchema,
+						}));
+						this.logger.debug(`[MCP][listTools] Returning tools with schemas: ${JSON.stringify(outputTools, null, 2)}`);
+						returnData.push({
+							json: { tools: outputTools },
 						});
-					});
-
-					returnData.push({
-						json: {
-							tools: aiTools.map((t: DynamicStructuredTool) => ({
-								name: t.name,
-								description: t.description,
-								schema: zodToJsonSchema(t.schema as z.ZodTypeAny || z.object({})),
-							})),
-						},
-					});
-					break;
+						break;
+					} catch (error) {
+						this.logger.error(`[MCP][listTools] Error in listTools operation: ${JSON.stringify(error, null, 2)}`);
+						throw new NodeOperationError(this.getNode(), `Error in listTools operation: ${(error as Error).message}`);
+					}
 				}
 
 				case 'executeTool': {
